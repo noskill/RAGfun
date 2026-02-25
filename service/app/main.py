@@ -75,6 +75,7 @@ async def lifespan(app: FastAPI):
         url=str(state.settings.embedding_url) if state.settings.embedding_url else None,
         model=state.settings.embedding_model,
         api_key=state.settings.embedding_api_key.get_secret_value() if state.settings.embedding_api_key else None,
+        dimensions=state.settings.embedding_dimensions,
         timeout_s=state.settings.embedding_timeout_s,
     )
 
@@ -392,5 +393,4 @@ async def search(payload: SearchRequest):
     )
     REQS.labels(endpoint="/v1/search", status="200").inc()
     return r
-
 

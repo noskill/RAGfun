@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     embedding_url: AnyHttpUrl | None = None
     embedding_model: str | None = None  # optional (e.g. OpenAI-compatible backends like Infinity)
     embedding_api_key: SecretStr | None = None
+    embedding_dimensions: int | None = None
     embedding_timeout_s: float = 10.0
     embedding_batch_size: int = 32
     embedding_concurrency: int = 1
@@ -117,6 +118,7 @@ class Settings(BaseSettings):
                 "url": str(self.embedding_url) if self.embedding_url else None,
                 "model": self.embedding_model,
                 "api_key_set": self.embedding_api_key is not None,
+                "dimensions": self.embedding_dimensions,
                 "timeout_s": self.embedding_timeout_s,
                 "batch_size": self.embedding_batch_size,
                 "concurrency": self.embedding_concurrency,
@@ -167,6 +169,11 @@ def load_settings() -> Settings:
         raise ValueError("RAG_EMBEDDING_PROVIDER=http requires RAG_EMBEDDING_URL")
     if s.embedding_concurrency <= 0:
         raise ValueError("RAG_EMBEDDING_CONCURRENCY must be > 0")
+    if s.embedding_dimensions is not None:
+        if s.embedding_dimensions <= 0:
+            raise ValueError("RAG_EMBEDDING_DIMENSIONS must be > 0")
+        if s.vector_size != s.embedding_dimensions:
+            raise ValueError("RAG_VECTOR_SIZE must match RAG_EMBEDDING_DIMENSIONS when set")
     if s.rerank_mode != "disabled":
         if s.rerank_provider == "http" and s.rerank_url is None:
             raise ValueError("RAG_RERANK_PROVIDER=http requires RAG_RERANK_URL when rerank is enabled")
@@ -183,5 +190,4 @@ def load_settings() -> Settings:
     if s.retrieval_candidates < 1:
         raise ValueError("RAG_RETRIEVAL_CANDIDATES must be >= 1")
     return s
-
 

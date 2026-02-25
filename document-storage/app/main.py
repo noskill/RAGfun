@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
 import time
@@ -287,8 +288,11 @@ async def store_document(
         }
 
         # Store file
+        # Storage backends expect a file-like object with .read()
         with LAT.labels(stage="store_file").time():
-            storage_id = await _run_sync(state.storage.store, doc_id, content, content_type)
+            storage_id, stored_size, content_hash = await _run_sync(
+                state.storage.store, doc_id, io.BytesIO(content), content_type
+            )
 
         # Deduplication (exact, bytes-level): storage_id is deterministic (sha256-based) for both local and s3 backends.
         duplicate_of: str | None = None
@@ -319,7 +323,7 @@ async def store_document(
                 storage_id=storage_id,
                 metadata={**full_metadata, "extra": {**existing_extra, "dedup": dedup_extra}},
                 content_type=content_type,
-                size=len(content),
+                size=stored_size,
             )
 
         REQS.labels(endpoint="/v1/documents/store", status="200").inc()

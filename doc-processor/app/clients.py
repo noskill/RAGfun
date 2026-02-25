@@ -111,6 +111,48 @@ class VLMClient:
             raise RuntimeError("vlm_unexpected_response")
 
 
+class LandingAIClient:
+    """
+    LandingAI ADE Parse client for PDF -> Markdown.
+    """
+
+    def __init__(
+        self,
+        *,
+        parse_url: str,
+        api_key: str | None,
+        model: str,
+        split: str | None,
+        timeout_s: float,
+    ) -> None:
+        self._parse_url = parse_url.rstrip("/")
+        self._api_key = api_key
+        self._model = model
+        self._split = split
+        self._timeout_s = timeout_s
+
+    async def parse_pdf(self, *, pdf_bytes: bytes, filename: str | None) -> dict[str, Any]:
+        headers = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+
+        # LandingAI expects multipart form-data.
+        data = {"model": self._model}
+        if self._split:
+            data["split"] = self._split
+        files = {
+            "document": (
+                (filename or "document.pdf"),
+                pdf_bytes,
+                "application/pdf",
+            )
+        }
+
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.post(self._parse_url, data=data, files=files, headers=headers)
+            r.raise_for_status()
+            return r.json()
+
 
 
 

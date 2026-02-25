@@ -121,6 +121,21 @@ async def handle_index(
             r.raise_for_status()
             resp = r.json()
     if resp.get("ok") is not True:
+        try:
+            logger.error(
+                "doc_processor_failed",
+                extra={
+                    "extra": {
+                        "doc_id": doc_id,
+                        "task_id": task_id,
+                        "attempt": attempt,
+                        "error": resp.get("error"),
+                        "detail": resp.get("detail"),
+                    }
+                },
+            )
+        except Exception:
+            logger.error("doc_processor_failed", extra={"extra": {"doc_id": doc_id, "task_id": task_id}})
         raise RuntimeError(f"doc_processor_ok_false:{resp.get('error') or 'unknown'}")
     if resp.get("skipped") is True:
         now = time.time()

@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 from app.chunking import chunk_by_strategy
-from app.clients import RetrievalClient, StorageClient, VLMClient
+from app.clients import LandingAIClient, RetrievalClient, StorageClient, VLMClient
 from app.config import Settings, load_settings
 from app.extraction import extract_text_non_vlm, normalize_to_pdf, pdf_to_page_pngs
 from app.logging_setup import setup_json_logging
@@ -55,7 +55,7 @@ PROCESSOR_EXTRACTED_CHARS = Histogram(
 )
 
 # Pre-create common label series so Grafana panels show 0 instead of "No data" right after startup.
-for _p in ("vlm", "non_vlm", "skipped_duplicate"):
+for _p in ("vlm", "landing_ai", "non_vlm", "skipped_duplicate"):
     PROCESSOR_PATH.labels(_p).inc(0)
 PROCESSOR_PARTIAL.labels(endpoint="/v1/process").inc(0)
 
@@ -65,9 +65,74 @@ class AppState:
     storage: StorageClient | None = None
     retrieval: RetrievalClient | None = None
     vlm: VLMClient | None = None
+    landing: LandingAIClient | None = None
 
 
 state = AppState()
+
+
+def _landing_parse_to_pages(parse_json: dict, *, max_pages: int | None) -> list[str]:
+    def _as_int(v: object) -> int | None:
+        try:
+            return int(v)  # type: ignore[arg-type]
+        except Exception:
+            return None
+
+    # Preferred: splits (when split=page)
+    page_map: dict[int, list[str]] = {}
+    splits = parse_json.get("splits")
+    if isinstance(splits, list) and splits:
+        for sp in splits:
+            if not isinstance(sp, dict):
+                continue
+            md = sp.get("markdown") or ""
+            if not md:
+                continue
+            pages = sp.get("pages")
+            if isinstance(pages, list) and pages:
+                for p in pages:
+                    pi = _as_int(p)
+                    if pi is None or pi < 0:
+                        continue
+                    if max_pages is not None and pi >= max_pages:
+                        continue
+                    page_map.setdefault(pi, []).append(md)
+        if page_map:
+            max_idx = max(page_map)
+            pages_text = ["" for _ in range(max_idx + 1)]
+            for p, parts in page_map.items():
+                pages_text[p] = "\n\n".join(parts)
+            return pages_text
+
+    # Fallback: chunks with grounding.page
+    page_map = {}
+    chunks = parse_json.get("chunks")
+    if isinstance(chunks, list):
+        for ch in chunks:
+            if not isinstance(ch, dict):
+                continue
+            md = ch.get("markdown") or ""
+            if not md:
+                continue
+            grounding = ch.get("grounding") if isinstance(ch.get("grounding"), dict) else {}
+            pi = _as_int(grounding.get("page"))
+            if pi is None or pi < 0:
+                pi = 0
+            if max_pages is not None and pi >= max_pages:
+                continue
+            page_map.setdefault(pi, []).append(md)
+        if page_map:
+            max_idx = max(page_map)
+            pages_text = ["" for _ in range(max_idx + 1)]
+            for p, parts in page_map.items():
+                pages_text[p] = "\n\n".join(parts)
+            return pages_text
+
+    # Final fallback: single markdown blob
+    md = parse_json.get("markdown") or ""
+    if md:
+        return [md]
+    return []
 
 
 @asynccontextmanager
@@ -84,12 +149,21 @@ async def lifespan(app: FastAPI):
     setup_json_logging(state.settings.log_level)
     state.storage = StorageClient(base_url=str(state.settings.storage_url), timeout_s=state.settings.storage_timeout_s)
     state.retrieval = RetrievalClient(base_url=str(state.settings.retrieval_url), timeout_s=state.settings.retrieval_timeout_s)
-    state.vlm = VLMClient(
-        base_url=str(state.settings.vlm_base_url),
-        api_key=state.settings.vlm_api_key.get_secret_value() if state.settings.vlm_api_key else None,
-        model=state.settings.vlm_model,
-        timeout_s=state.settings.vlm_timeout_s,
-    )
+    if state.settings.vlm_provider == "landing_ai":
+        state.landing = LandingAIClient(
+            parse_url=str(state.settings.landing_parse_url),
+            api_key=state.settings.landing_api_key.get_secret_value() if state.settings.landing_api_key else None,
+            model=state.settings.landing_model,
+            split=state.settings.landing_split,
+            timeout_s=state.settings.landing_timeout_s,
+        )
+    else:
+        state.vlm = VLMClient(
+            base_url=str(state.settings.vlm_base_url),
+            api_key=state.settings.vlm_api_key.get_secret_value() if state.settings.vlm_api_key else None,
+            model=state.settings.vlm_model,
+            timeout_s=state.settings.vlm_timeout_s,
+        )
     yield
 
 
@@ -230,63 +304,93 @@ async def process(req: ProcessRequest):
         degraded.append("vlm_skipped")
         PROCESSOR_PATH.labels("non_vlm").inc()
     else:
-        # VLM path: render pages -> ask VLM per page.
-        with LAT.labels("pdf_render").time():
-            pngs = pdf_to_page_pngs(
-                pdf_bytes,
-                max_pages=state.settings.max_pages,
-                max_side_px=state.settings.max_image_side_px,
-            )
-        pages = len(pngs)
-        if pages == 0:
-            REQS.labels(endpoint="/v1/process", status="400").inc()
-            return ProcessResponse(ok=False, doc_id=doc_id, content_type=norm_ct, error="no_pages", detail="no pages rendered")
+        if state.settings.vlm_provider == "landing_ai":
+            if state.landing is None:
+                REQS.labels(endpoint="/v1/process", status="500").inc()
+                return ProcessResponse(ok=False, doc_id=doc_id, error="landing_ai_unavailable", detail="LandingAI client not configured")
 
-        async def one(i: int, b: bytes) -> tuple[int, str]:
-            t = await state.vlm.page_to_text(png_bytes=b)
-            return (i, t)
+            with LAT.labels("landing_parse").time():
+                parse_json = await state.landing.parse_pdf(pdf_bytes=pdf_bytes, filename=filename)
+            pages_text = _landing_parse_to_pages(parse_json, max_pages=state.settings.max_pages)
+            pages = len(pages_text)
+            if pages == 0:
+                REQS.labels(endpoint="/v1/process", status="400").inc()
+                return ProcessResponse(ok=False, doc_id=doc_id, content_type=norm_ct, error="no_pages", detail="LandingAI returned no pages")
 
-        with LAT.labels("vlm").time():
-            # bounded parallelism
-            sem = asyncio.Semaphore(4)
+            if all(not (t or "").strip() for t in pages_text):
+                REQS.labels(endpoint="/v1/process", status="400").inc()
+                return ProcessResponse(
+                    ok=False,
+                    doc_id=doc_id,
+                    content_type=norm_ct,
+                    pages=pages,
+                    error="empty_text",
+                    detail="LandingAI returned empty text for all pages",
+                    partial=partial,
+                    degraded=degraded,
+                )
 
-            async def run_one(i: int, b: bytes):
-                async with sem:
-                    return await one(i, b)
+            content_type = norm_ct
+            PROCESSOR_PATH.labels("landing_ai").inc()
+        else:
+            # VLM path: render pages -> ask VLM per page.
+            with LAT.labels("pdf_render").time():
+                pngs = pdf_to_page_pngs(
+                    pdf_bytes,
+                    max_pages=state.settings.max_pages,
+                    max_side_px=state.settings.max_image_side_px,
+                )
+            pages = len(pngs)
+            if pages == 0:
+                REQS.labels(endpoint="/v1/process", status="400").inc()
+                return ProcessResponse(ok=False, doc_id=doc_id, content_type=norm_ct, error="no_pages", detail="no pages rendered")
 
-            results = await asyncio.gather(*(run_one(i, b) for i, b in enumerate(pngs)), return_exceptions=True)
+            async def one(i: int, b: bytes) -> tuple[int, str]:
+                assert state.vlm is not None
+                t = await state.vlm.page_to_text(png_bytes=b)
+                return (i, t)
 
-        for r in results:
-            if isinstance(r, Exception):
-                degraded.append("vlm_page_failed")
-                partial = True
-                continue
-            i, t = r
-            if t:
-                # 1-based page number in locator
-                while len(pages_text) < i + 1:
-                    pages_text.append("")
-                pages_text[i] = t
+            with LAT.labels("vlm").time():
+                # bounded parallelism
+                sem = asyncio.Semaphore(4)
 
-        # Ensure list length
-        if len(pages_text) < pages:
-            pages_text.extend([""] * (pages - len(pages_text)))
+                async def run_one(i: int, b: bytes):
+                    async with sem:
+                        return await one(i, b)
 
-        if all(not t.strip() for t in pages_text):
-            REQS.labels(endpoint="/v1/process", status="400").inc()
-            return ProcessResponse(
-                ok=False,
-                doc_id=doc_id,
-                content_type=norm_ct,
-                pages=pages,
-                error="empty_text",
-                detail="VLM returned empty text for all pages",
-                partial=partial,
-                degraded=degraded,
-            )
+                results = await asyncio.gather(*(run_one(i, b) for i, b in enumerate(pngs)), return_exceptions=True)
 
-        content_type = norm_ct
-        PROCESSOR_PATH.labels("vlm").inc()
+            for r in results:
+                if isinstance(r, Exception):
+                    degraded.append("vlm_page_failed")
+                    partial = True
+                    continue
+                i, t = r
+                if t:
+                    # 1-based page number in locator
+                    while len(pages_text) < i + 1:
+                        pages_text.append("")
+                    pages_text[i] = t
+
+            # Ensure list length
+            if len(pages_text) < pages:
+                pages_text.extend([""] * (pages - len(pages_text)))
+
+            if all(not t.strip() for t in pages_text):
+                REQS.labels(endpoint="/v1/process", status="400").inc()
+                return ProcessResponse(
+                    ok=False,
+                    doc_id=doc_id,
+                    content_type=norm_ct,
+                    pages=pages,
+                    error="empty_text",
+                    detail="VLM returned empty text for all pages",
+                    partial=partial,
+                    degraded=degraded,
+                )
+
+            content_type = norm_ct
+            PROCESSOR_PATH.labels("vlm").inc()
 
     # Build chunks (preserve page in locator when we have pages)
     chunks: list[ChunkMeta] = []
@@ -351,6 +455,22 @@ async def process(req: ProcessRequest):
         retrieval_partial = bool(retrieval_resp.get("partial"))
 
     if not retrieval_ok or retrieval_partial:
+        # Log retrieval failure details for debugging.
+        try:
+            logger.error(
+                "retrieval_upsert_failed",
+                extra={
+                    "extra": {
+                        "doc_id": doc_id,
+                        "retrieval_ok": retrieval_ok,
+                        "retrieval_partial": retrieval_partial,
+                        "retrieval_error": retrieval_resp.get("error") if isinstance(retrieval_resp, dict) else None,
+                        "retrieval_degraded": retrieval_resp.get("degraded") if isinstance(retrieval_resp, dict) else None,
+                    }
+                },
+            )
+        except Exception:
+            logger.error("retrieval_upsert_failed", extra={"extra": {"doc_id": doc_id}})
         REQS.labels(endpoint="/v1/process", status="502").inc()
         return ProcessResponse(
             ok=False,
@@ -387,7 +507,3 @@ async def process(req: ProcessRequest):
         partial=partial,
         degraded=degraded,
     )
-
-
-
-

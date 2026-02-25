@@ -1,16 +1,15 @@
-name: rugfunsota
-
 services:
   opensearch:
     image: opensearchproject/opensearch:latest
+    container_name: opensearch
     environment:
       - discovery.type=single-node
       - plugins.security.disabled=true
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-StrongPassword123!}
       - "OPENSEARCH_JAVA_OPTS=-Xms16g -Xmx16g"
     ports:
-      - "${RUGFUNSOTA_OS_PORT:-9201}:9200"
-      - "${RUGFUNSOTA_OS_DEBUG_PORT:-9601}:9600"
+      - "9200:9200"
+      - "9600:9600"
     volumes:
       - opensearch-data:/usr/share/opensearch/data
     networks:
@@ -24,12 +23,13 @@ services:
 
   qdrant:
     image: qdrant/qdrant:latest
+    container_name: qdrant
     environment:
       # Reduce noisy per-request access logs from actix_web middleware logger.
       - RUST_LOG=warn,actix_web=warn
     ports:
-      - "${RUGFUNSOTA_QDRANT_HTTP:-6335}:6333"
-      - "${RUGFUNSOTA_QDRANT_GRPC:-6336}:6334"
+      - "6333:6333"
+      - "6334:6334"
     volumes:
       - qdrant-data:/qdrant/storage
     networks:
@@ -49,6 +49,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    container_name: postgres
     command:
       - "postgres"
       - "-c"
@@ -65,7 +66,7 @@ services:
       - POSTGRES_DB=document_storage
       - POSTGRES_MAX_CONNECTIONS=${POSTGRES_MAX_CONNECTIONS:-1000}
     ports:
-      - "127.0.0.1:${RUGFUNSOTA_PG_PORT:-5434}:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
@@ -79,6 +80,7 @@ services:
 
   pgbouncer:
     image: edoburu/pgbouncer:latest
+    container_name: pgbouncer
     environment:
       - DB_HOST=postgres
       - DB_PORT=5432
@@ -98,41 +100,51 @@ services:
     networks:
       - rag-network
 
-  # RustFS: not started by default; use existing presign-rustfs-1. To run own: docker compose --profile local-rustfs up -d
+  # RustFS (S3-compatible object storage for document-storage)
   rustfs:
-    profiles:
-      - local-rustfs
     image: rustfs/rustfs:latest
     container_name: rustfs-server
+    user: "0:0"
     security_opt:
       - "no-new-privileges:true"
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:9000" # S3 API port
+      - "9001:9001" # Console port
     environment:
       - RUSTFS_VOLUMES=/data/rustfs{0...3}
       - RUSTFS_ADDRESS=0.0.0.0:9000
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_EXTERNAL_ADDRESS=:9000
+      - RUSTFS_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_OBS_LOGGER_LEVEL=info
+      - RUSTFS_TLS_PATH=/opt/tls
+      # Object Cache
+      - RUSTFS_OBJECT_CACHE_ENABLE=true
+      - RUSTFS_OBJECT_CACHE_TTL_SECS=300
     volumes:
       - rustfs_data_0:/data/rustfs0
       - rustfs_data_1:/data/rustfs1
       - rustfs_data_2:/data/rustfs2
       - rustfs_data_3:/data/rustfs3
+      - rustfs_logs:/app/logs
     networks:
       - rag-network
       - rustfs-network
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9000/ || exit 1"]
-      interval: 15s
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"]
+      interval: 30s
       timeout: 10s
-      retries: 10
-      start_period: 90s
+      retries: 3
+      start_period: 40s
 
   rabbitmq:
     image: rabbitmq:3-management
+    container_name: rabbitmq
     # Enable built-in Prometheus metrics plugin (exposes :15692/metrics)
     command: >
       sh -c "
@@ -140,9 +152,9 @@ services:
         rabbitmq-server
       "
     ports:
-      - "${RUGFUNSOTA_RABBIT_AMQP:-5673}:5672"
-      - "${RUGFUNSOTA_RABBIT_HTTP:-15673}:15672"
-      - "${RUGFUNSOTA_RABBIT_PROM:-15693}:15692"
+      - "5672:5672"
+      - "15672:15672"
+      - "15692:15692"
     environment:
       - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER:-guest}
       - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS:-guest}
@@ -159,9 +171,15 @@ services:
 
   infinity-embed:
     image: michaelf34/infinity:latest
+    container_name: infinity-embed
+    # Stronger multilingual embedding model (better recall for RU factoid QA).
+    # NOTE: this changes vector dimensionality -> requires re-indexing into a new Qdrant collection.
     command: ["v2", "--model-id", "BAAI/bge-m3", "--port", "7997"]
     environment:
-      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_DEVICE_EMBED:-0}
+      # Make the container see NVIDIA GPUs (requires NVIDIA Container Toolkit on host).
+      # Pin embeddings service to GPU id 0.
+      - NVIDIA_VISIBLE_DEVICES=4
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     networks:
       - rag-network
     deploy:
@@ -169,16 +187,17 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["${NVIDIA_DEVICE_EMBED:-0}"]
-              capabilities: [gpu]
+              device_ids:
+                - "2"
+              capabilities:
+                - gpu
 
   # Stateless Hybrid Retrieval microservice (scale this one for multiple replicas)
   retrieval:
     build:
-      context: .
-      dockerfile: service/Dockerfile
+      context: ./service
     ports:
-      - "${RUGFUNSOTA_RETRIEVAL_PORT:-8085}:8080"
+      - "8080:8080"
     environment:
       # =========================
       # Retrieval / Search quality knobs (RAG_*)
@@ -188,14 +207,14 @@ services:
       - RAG_ENVIRONMENT=dev
       - RAG_LOG_LEVEL=INFO
       # OpenSearch (BM25)
-      - RAG_OS_URL=${RAG_OS_URL:-http://opensearch:9200}
+      - RAG_OS_URL=http://opensearch:9200
       # Optional auth:
       # - RAG_OS_USERNAME=...
       # - RAG_OS_PASSWORD=...
       - RAG_OS_INDEX_ALIAS=rag_chunks
       - RAG_OS_INDEX_PREFIX=rag_chunks_v
       # Qdrant (Vector)
-      - RAG_QDRANT_URL=${RAG_QDRANT_URL:-http://qdrant:6333}
+      - RAG_QDRANT_URL=http://qdrant:6333
       # Optional auth:
       # - RAG_QDRANT_API_KEY=...
       # Use a separate collection because the host Infinity embedding model is 512-dim
@@ -205,7 +224,7 @@ services:
       - RAG_VECTOR_DISTANCE=cosine
       # Embeddings (Infinity inside docker network)
       - RAG_EMBEDDING_PROVIDER=http
-      - RAG_EMBEDDING_URL=${RAG_EMBEDDING_URL:-http://infinity-embed:7997/embeddings}
+      - RAG_EMBEDDING_URL=http://infinity-embed:7997/embeddings
       - RAG_EMBEDDING_MODEL=BAAI/bge-m3
       # Optional auth (if your embeddings endpoint needs it):
       # - RAG_EMBEDDING_API_KEY=...
@@ -216,11 +235,9 @@ services:
       # Contextual Chunk Headers (CCH) for embeddings (opt-in; requires re-index/re-embed when enabled)
       - RAG_EMBEDDING_CONTEXTUAL_HEADERS_ENABLED=true
       - RAG_EMBEDDING_CONTEXTUAL_HEADERS_MAX_CHARS=400
-      # Chunking (mode=document): semchunk (default) or use docker-compose-semantic.yml for semantic
-      - RAG_CHUNK_STRATEGY=semchunk
-      - RAG_CHUNK_MAX_TOKENS=512
+      # Chunking (used only for mode=document indexing)
+      - RAG_CHUNK_MAX_TOKENS=300
       - RAG_CHUNK_OVERLAP_TOKENS=50
-      - RAG_CHUNK_ENCODING=cl100k_base
       # Candidate pool (QUALITY): increase recall before fusion/rerank
       - RAG_DEFAULT_TOP_K=20
       - RAG_BM25_TOP_K=200
@@ -234,10 +251,9 @@ services:
       - RAG_MAX_CHUNKS_PER_DOC=1
       # Sources / URI redaction
       - RAG_REDACT_URI_MODE=none
-      # Rerank: http (Infinity) or local (in-process CPU)
-      - RAG_RERANK_PROVIDER=http
+      # Rerank (Infinity rerank service started by this compose)
       - RAG_RERANK_MODE=auto
-      - RAG_RERANK_URL=${RAG_RERANK_URL:-http://infinity-rerank:7998/rerank}
+      - RAG_RERANK_URL=http://infinity-rerank:7998/rerank
       - RAG_RERANK_MODEL=BAAI/bge-reranker-v2-m3
       # Optional auth (if your rerank endpoint needs it):
       # - RAG_RERANK_API_KEY=...
@@ -259,30 +275,28 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_healthy
-      # infinity-embed / infinity-rerank optional when RAG_EMBEDDING_URL / RAG_RERANK_URL point to external services
-      # infinity-embed:
-      #   condition: service_started
-      # infinity-rerank:
-      #   condition: service_started
+      infinity-embed:
+        condition: service_started
+      infinity-rerank:
+        condition: service_started
     networks:
       - rag-network
-      # Optional: attach to rag_fun stack network for shared infinity-embed/rerank
-      # - rag_fun_rag-network
 
-  # Document Storage (S3: use existing presign-rustfs-1 on presign_rustfs-net)
+  # Document Storage Service
   document-storage:
     build:
       context: ./document-storage
     ports:
-      - "${RUGFUNSOTA_STORAGE_PORT:-8083}:8081"
+      - "8081:8081"
     environment:
+      # =========================
+      # Document storage (STORAGE_*)
+      # =========================
       - STORAGE_SERVICE_NAME=document-storage
       - STORAGE_ENVIRONMENT=dev
       - STORAGE_LOG_LEVEL=INFO
-      # Default local; for S3 set STORAGE_STORAGE_BACKEND=s3 and presign_rustfs-net
-      - STORAGE_STORAGE_BACKEND=${STORAGE_STORAGE_BACKEND:-local}
+      - STORAGE_STORAGE_BACKEND=s3
       - STORAGE_STORAGE_PATH=/data/documents
-      # S3: existing presign-rustfs-1 or run own with --profile local-rustfs
       - STORAGE_S3_ENDPOINT=${STORAGE_S3_ENDPOINT:-http://presign-rustfs-1:9000}
       - STORAGE_S3_BUCKET=${STORAGE_S3_BUCKET:-documents}
       - STORAGE_S3_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
@@ -292,6 +306,7 @@ services:
       - STORAGE_DB_POOL_MIN=${STORAGE_DB_POOL_MIN:-1}
       - STORAGE_DB_POOL_MAX=${STORAGE_DB_POOL_MAX:-${POSTGRES_MAX_CONNECTIONS:-1000}}
       - STORAGE_MAX_FILE_SIZE_MB=100
+      # Allow-list for uploaded file types (keep aligned with doc-processor capabilities)
       - STORAGE_ALLOWED_CONTENT_TYPES=text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/html,application/xhtml+xml,text/xml,application/xml
     volumes:
       - document-storage-data:/data/documents
@@ -304,26 +319,30 @@ services:
       - rag-network
       - presign_rustfs-net
 
-  # vLLM (OpenAI-compatible) hosting Granite-Docling VLM. Single GPU: 0; multi-GPU: 0 or 1
+  # vLLM (OpenAI-compatible) hosting Granite-Docling VLM for document-to-text extraction.
+  # NOTE: requires NVIDIA GPU + drivers on the host.
   vllm-docling:
-    image: vllm/vllm-openai:latest
-    command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123"]
+    image: vishva123/vllm-server-cuda-12.6.3
+    container_name: vllm-docling
+    command: ["--model", "ibm-granite/granite-docling-258M", "--port", "8123", "--gpu-memory-utilization", "0.4"]
     ports:
-      - "8124:8123"
+      - "8123:8123"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     environment:
       - HF_HOME=/root/.cache/huggingface
-      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_DEVICE_VLLM:-0}
     networks:
       - rag-network
+    #If your Docker supports it, uncomment GPU settings below:
     deploy:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              device_ids: ["${NVIDIA_DEVICE_VLLM:-0}"]
-              capabilities: [gpu]
+          - driver: nvidia
+            device_ids:
+              - "0"
+            capabilities:
+              - gpu
 
   # Document Processor Service (pulls files from document-storage, uses Granite-Docling via vLLM, indexes into retrieval)
   doc-processor:
@@ -350,8 +369,7 @@ services:
       - PROCESSOR_VLM_TIMEOUT_S=180
       - PROCESSOR_MAX_PAGES=35
       - PROCESSOR_MAX_IMAGE_SIDE_PX=2000
-      # Chunking: semantic (section-based) or fixed (char-based)
-      - PROCESSOR_CHUNK_STRATEGY=semantic
+      # Chunking knobs
       - PROCESSOR_CHUNK_SIZE_CHARS=4000
       - PROCESSOR_CHUNK_OVERLAP_CHARS=300
     depends_on:
@@ -359,9 +377,8 @@ services:
         condition: service_started
       retrieval:
         condition: service_started
-      # vllm-docling optional for .txt (doc-processor uses extract_text_non_vlm). For PDF/DOCX start vllm-docling or add condition: service_started
-      # vllm-docling:
-      #   condition: service_started
+      vllm-docling:
+        condition: service_started
     networks:
       - rag-network
 
@@ -400,10 +417,9 @@ services:
   # RAG LLM gate (calls retrieval + LLM)
   rag-gate:
     build:
-      context: .
-      dockerfile: gate/Dockerfile
+      context: ./gate
     ports:
-      - "${RUGFUNSOTA_GATE_PORT:-8092}:8090"
+      - "8090:8090"
     environment:
       # =========================
       # Gate / RAG orchestration (GATE_*)
@@ -411,8 +427,8 @@ services:
       - GATE_SERVICE_NAME=rag-gate
       - GATE_ENVIRONMENT=dev
       - GATE_LOG_LEVEL=INFO
-      # Use docker network service name for retrieval. Override in .env if rugfunsota retrieval hangs (both stacks): GATE_RETRIEVAL_URL=http://host.docker.internal:8080
-      - GATE_RETRIEVAL_URL=${GATE_RETRIEVAL_URL:-http://retrieval:8080}
+      # Use docker network service name for retrieval (no public port required)
+      - GATE_RETRIEVAL_URL=http://retrieval:8080
       - GATE_RETRIEVAL_TIMEOUT_S=60
       - GATE_RETRIEVAL_MODE=hybrid
       # Default top_k for chat requests (ru_eval overrides per-request, but keeping this aligned helps).
@@ -464,27 +480,19 @@ services:
     networks:
       - rag-network
 
-  # Agentic search service (agent_cli as a microservice). Optional: dir removed in cleanup-sota-repo.
+  # Agentic search service (agent_cli as a microservice)
   agent-search:
-    profiles:
-      - agent-search
     build:
-      context: .
-      dockerfile: agent-search/Dockerfile
+      context: ./agent-search
     ports:
-      - "${RUGFUNSOTA_AGENT_PORT:-8093}:8091"
+      - "8091:8091"
     environment:
       - AGENT_GATE_URL=http://rag-gate:8090
       - AGENT_GATE_TIMEOUT_S=60
-      - AGENT_MAX_LLM_CALLS=${AGENT_MAX_LLM_CALLS:-12}
-      - AGENT_MAX_FACT_QUERIES=${AGENT_MAX_FACT_QUERIES:-2}
       - AGENT_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
       - AGENT_LLM_MODEL=${GATE_LLM_MODEL:-openai/gpt-oss-120bt}
       - AGENT_LLM_API_KEY=${GATE_LLM_API_KEY:-}
       - AGENT_LLM_TIMEOUT_S=60
-      - AGENT_USE_HYDE=${AGENT_USE_HYDE:-}
-      - AGENT_USE_FACT_QUERIES=${AGENT_USE_FACT_QUERIES:-true}
-      - AGENT_USE_RETRY=${AGENT_USE_RETRY:-true}
     depends_on:
       rag-gate:
         condition: service_started
@@ -493,12 +501,38 @@ services:
     networks:
       - rag-network
 
+  # Deep research service (langgraph + gate MCP)
+#  deep-research:
+#    build:
+#      context: ./deep-research
+#    ports:
+#      - "8092:8092"
+#    environment:
+#      - DEEP_LLM_PROVIDER=${GATE_LLM_PROVIDER:-mock}
+#      - DEEP_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
+#      - DEEP_LLM_API_KEY=${GATE_LLM_API_KEY:-}
+#      - DEEP_LLM_MODEL=${GATE_LLM_MODEL:-meta-llama/llama-3.3-70b-instruct}
+#      - DEEP_GATE_URL=http://rag-gate:8090
+#      - DEEP_GATE_TIMEOUT_S=60
+#      - DEEP_LLM_TEMPERATURE=0
+#      - DEEP_MAX_ITERATIONS=2
+#      - DEEP_RETRIEVAL_MODE=hybrid
+#      - DEEP_TOP_K=8
+#      - DEEP_RERANK=true
+#    depends_on:
+#      rag-gate:
+#        condition: service_started
+#    extra_hosts:
+#      - "host.docker.internal:host-gateway"
+#    networks:
+#      - rag-network
+
   # Simple frontend (nginx static + proxy /api to rag-gate)
   ui:
     build:
       context: ./ui
     ports:
-      - "3301:80"
+      - "3300:80"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -508,12 +542,15 @@ services:
       - rag-network
 
   # Rerank service (Infinity). Kept in the same docker network for stable DNS (infinity-rerank).
-  # 1 GPU: NVIDIA_DEVICE_RERANK=0. 2 GPU: NVIDIA_DEVICE_RERANK=1
   infinity-rerank:
     image: michaelf34/infinity:latest
+    container_name: infinity-rerank
     command: ["v2", "--model-id", "BAAI/bge-reranker-v2-m3", "--port", "7998"]
     environment:
-      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_DEVICE_RERANK:-0}
+      # Make the container see NVIDIA GPUs (requires NVIDIA Container Toolkit on host).
+      # Pin embeddings service to GPU id 0.
+      - NVIDIA_VISIBLE_DEVICES=2
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     networks:
       - rag-network
     deploy:
@@ -521,8 +558,10 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["${NVIDIA_DEVICE_RERANK:-0}"]
-              capabilities: [gpu]
+              device_ids:
+                - "2"
+              capabilities:
+                - gpu
   prometheus:
     image: prom/prometheus:v2.55.0
     container_name: prometheus
@@ -559,7 +598,6 @@ services:
       - "--es.all"
       - "--es.indices"
       - "--es.shards"
-      - "--es.cluster_settings"
       - "--es.timeout=10s"
     depends_on:
       opensearch:
@@ -640,9 +678,5 @@ networks:
     driver: bridge
   rustfs-network:
     driver: bridge
-  # Network of existing RustFS (presign-rustfs-1)
   presign_rustfs-net:
-    external: true
-  # rag_fun stack network for retrieval to use shared infinity-embed/rerank when no GPU
-  rag_fun_rag-network:
-    external: true
+    external: false 

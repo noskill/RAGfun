@@ -15,6 +15,7 @@ class EmbeddingsClient:
         url: str | None,
         model: str | None,
         api_key: str | None,
+        dimensions: int | None,
         timeout_s: float,
     ):
         self.provider = provider
@@ -22,6 +23,7 @@ class EmbeddingsClient:
         self.url = url
         self.model = model
         self.api_key = api_key
+        self.dimensions = dimensions
         self.timeout_s = timeout_s
         # Reuse a single HTTP client to avoid per-request connection setup overhead
         # (especially visible during indexing batches and multi-query retrieval).
@@ -61,6 +63,9 @@ class EmbeddingsClient:
         # Support OpenAI-compatible embedding backends (e.g. Infinity) that require a model id.
         if self.model:
             payload["model"] = self.model
+        # OpenAI embeddings support a dimensions parameter (text-embedding-3+).
+        if self.dimensions:
+            payload["dimensions"] = int(self.dimensions)
         client = self._get_client()
         try:
             r = await client.post(self.url, json=payload, headers=headers)
@@ -91,5 +96,4 @@ class EmbeddingsClient:
                 return out
 
         raise RuntimeError("Bad embeddings response: expected 'vectors' or OpenAI-style 'data[].embedding'")
-
 

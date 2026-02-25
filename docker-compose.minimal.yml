@@ -1,0 +1,350 @@
+services:
+  # Core data stores
+  opensearch:
+    image: opensearchproject/opensearch:latest
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-StrongPassword123!}
+      - "OPENSEARCH_JAVA_OPTS=-Xms16g -Xmx16g"
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    environment:
+      - RUST_LOG=warn,actix_web=warn
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - rag-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bash",
+          "-lc",
+          "exec 3<>/dev/tcp/localhost/6333; printf 'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; head -n 1 <&3 | grep -q '200'"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=${POSTGRES_MAX_CONNECTIONS:-1000}"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "work_mem=8MB"
+      - "-c"
+      - "maintenance_work_mem=256MB"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=document_storage
+      - POSTGRES_MAX_CONNECTIONS=${POSTGRES_MAX_CONNECTIONS:-1000}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # S3-compatible object storage for document bytes
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs-server
+    user: "0:0"
+    security_opt:
+      - "no-new-privileges:true"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - RUSTFS_VOLUMES=/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_EXTERNAL_ADDRESS=:9000
+      - RUSTFS_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_OBS_LOGGER_LEVEL=info
+      - RUSTFS_TLS_PATH=/opt/tls
+      - RUSTFS_OBJECT_CACHE_ENABLE=true
+      - RUSTFS_OBJECT_CACHE_TTL_SECS=300
+    volumes:
+      - rustfs_data_0:/data/rustfs0
+      - rustfs_data_1:/data/rustfs1
+      - rustfs_data_2:/data/rustfs2
+      - rustfs_data_3:/data/rustfs3
+      - rustfs_logs:/app/logs
+    networks:
+      - rag-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:9000/health && curl -f http://localhost:9001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Async task queue for ingestion
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER:-guest}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS:-guest}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Stateless Hybrid Retrieval microservice
+  retrieval:
+    build:
+      context: .
+      dockerfile: service/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - RAG_SERVICE_NAME=hybrid-retrieval
+      - RAG_ENVIRONMENT=dev
+      - RAG_LOG_LEVEL=INFO
+      - RAG_OS_URL=http://opensearch:9200
+      - RAG_OS_INDEX_ALIAS=rag_chunks
+      - RAG_OS_INDEX_PREFIX=rag_chunks_v
+      - RAG_QDRANT_URL=http://qdrant:6333
+      - RAG_QDRANT_COLLECTION=rag_chunks_openai_1024
+      - RAG_VECTOR_DISTANCE=cosine
+      - RAG_EMBEDDING_PROVIDER=http
+      - RAG_EMBEDDING_URL=https://api.openai.com/v1/embeddings
+      - RAG_EMBEDDING_MODEL=text-embedding-3-small
+      - RAG_EMBEDDING_API_KEY=${RAG_EMBEDDING_API_KEY:-}
+      - RAG_EMBEDDING_DIMENSIONS=1024
+      - RAG_EMBEDDING_TIMEOUT_S=30
+      - RAG_EMBEDDING_BATCH_SIZE=128
+      - RAG_EMBEDDING_CONCURRENCY=4
+      - RAG_VECTOR_SIZE=1024
+      - RAG_RERANK_MODE=disabled
+      - RAG_ENABLE_PAGE_DEDUPLICATION=true
+      - RAG_ENABLE_PARENT_PAGE_RETRIEVAL=true
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - rag-network
+
+  # Document Storage Service
+  document-storage:
+    build:
+      context: ./document-storage
+    ports:
+      - "8081:8081"
+    environment:
+      - STORAGE_SERVICE_NAME=document-storage
+      - STORAGE_ENVIRONMENT=dev
+      - STORAGE_LOG_LEVEL=INFO
+      - STORAGE_STORAGE_BACKEND=s3
+      - STORAGE_STORAGE_PATH=/data/documents
+      - STORAGE_S3_ENDPOINT=http://rustfs:9000
+      - STORAGE_S3_BUCKET=${STORAGE_S3_BUCKET:-documents}
+      - STORAGE_S3_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      - STORAGE_S3_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - STORAGE_S3_REGION=${STORAGE_S3_REGION:-us-east-1}
+      - STORAGE_DB_URL=postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/document_storage
+      - STORAGE_DB_POOL_MIN=${STORAGE_DB_POOL_MIN:-1}
+      - STORAGE_DB_POOL_MAX=${STORAGE_DB_POOL_MAX:-${POSTGRES_MAX_CONNECTIONS:-1000}}
+      - STORAGE_MAX_FILE_SIZE_MB=100
+      - STORAGE_ALLOWED_CONTENT_TYPES=text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/html,application/xhtml+xml,text/xml,application/xml
+    volumes:
+      - document-storage-data:/data/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+    networks:
+      - rag-network
+
+  # Document Processor Service
+  doc-processor:
+    build:
+      context: ./doc-processor
+    environment:
+      - PROCESSOR_SERVICE_NAME=doc-processor
+      - PROCESSOR_ENVIRONMENT=dev
+      - PROCESSOR_LOG_LEVEL=INFO
+      - PROCESSOR_STORAGE_URL=http://document-storage:8081
+      - PROCESSOR_STORAGE_TIMEOUT_S=60
+      - PROCESSOR_RETRIEVAL_URL=http://retrieval:8080
+      - PROCESSOR_RETRIEVAL_TIMEOUT_S=60
+      - PROCESSOR_VLM_PROVIDER=landing_ai
+      - PROCESSOR_LANDING_API_KEY=${PROCESSOR_LANDING_API_KEY:-}
+      - PROCESSOR_LANDING_PARSE_URL=${PROCESSOR_LANDING_PARSE_URL:-https://api.va.landing.ai/v1/ade/parse}
+      - PROCESSOR_LANDING_MODEL=${PROCESSOR_LANDING_MODEL:-dpt-2-latest}
+      - PROCESSOR_LANDING_SPLIT=${PROCESSOR_LANDING_SPLIT:-page}
+      - PROCESSOR_LANDING_TIMEOUT_S=${PROCESSOR_LANDING_TIMEOUT_S:-180}
+      - PROCESSOR_MAX_PAGES=35
+      - PROCESSOR_MAX_IMAGE_SIDE_PX=2000
+      - PROCESSOR_CHUNK_SIZE_CHARS=4000
+      - PROCESSOR_CHUNK_OVERLAP_CHARS=300
+    depends_on:
+      document-storage:
+        condition: service_started
+      retrieval:
+        condition: service_started
+    networks:
+      - rag-network
+
+  # Ingestion worker
+  ingestion-worker:
+    build:
+      context: ./doc-processor
+    command: ["python", "-m", "app.worker"]
+    environment:
+      - WORKER_RABBIT_URL=amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/
+      - WORKER_QUEUE=ingestion.tasks
+      - WORKER_RETRY_QUEUE=ingestion.tasks.retry
+      - WORKER_DLQ_QUEUE=ingestion.tasks.dlq
+      - WORKER_RETRY_TTL_MS=5000
+      - WORKER_MAX_ATTEMPTS=5
+      - WORKER_PREFETCH=5
+      - WORKER_METRICS_PORT=8083
+      - WORKER_STORAGE_URL=http://document-storage:8081
+      - WORKER_STORAGE_TIMEOUT_S=60
+      - WORKER_RETRIEVAL_URL=http://retrieval:8080
+      - WORKER_RETRIEVAL_TIMEOUT_S=60
+      - WORKER_DOC_PROCESSOR_URL=http://doc-processor:8082
+      - WORKER_DOC_PROCESSOR_TIMEOUT_S=300
+      - WORKER_LOG_LEVEL=INFO
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      document-storage:
+        condition: service_started
+      retrieval:
+        condition: service_started
+      doc-processor:
+        condition: service_started
+    networks:
+      - rag-network
+
+  # RAG LLM gate (calls retrieval + LLM)
+  rag-gate:
+    build:
+      context: .
+      dockerfile: gate/Dockerfile
+    ports:
+      - "8090:8090"
+    environment:
+      - GATE_SERVICE_NAME=rag-gate
+      - GATE_ENVIRONMENT=dev
+      - GATE_LOG_LEVEL=INFO
+      - GATE_RETRIEVAL_URL=http://retrieval:8080
+      - GATE_RETRIEVAL_TIMEOUT_S=60
+      - GATE_RETRIEVAL_MODE=hybrid
+      - GATE_TOP_K=8
+      - GATE_MAX_CONTEXT_CHARS=18000
+      - GATE_SEGMENT_STITCHING_ENABLED=false
+      - GATE_SEGMENT_STITCHING_MAX_CHUNKS=4
+      - GATE_SEGMENT_STITCHING_GROUP_BY_PAGE=true
+      - GATE_MULTI_QUERY_ENABLED=true
+      - GATE_MULTI_QUERY_MAX_QUERIES=4
+      - GATE_MULTI_QUERY_TOP_K_MULTIPLIER=12
+      - GATE_MULTI_QUERY_RRF_K=60
+      - GATE_TWO_PASS_ENABLED=false
+      - GATE_TWO_PASS_HINT_MAX_TERMS=8
+      - GATE_TWO_PASS_MIN_UNIQUE_DOCS=3
+      - GATE_BM25_ANCHOR_ENABLED=true
+      - GATE_BM25_ANCHOR_TOP_K=60
+      - GATE_BM25_ANCHOR_RRF_K=60
+      - GATE_STORAGE_URL=http://document-storage:8081
+      - GATE_STORAGE_TIMEOUT_S=60
+      - GATE_DOC_PROCESSOR_URL=http://doc-processor:8082
+      - GATE_DOC_PROCESSOR_TIMEOUT_S=300
+      - GATE_RABBIT_URL=amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/
+      - GATE_RABBIT_QUEUE=ingestion.tasks
+      - GATE_LLM_PROVIDER=${GATE_LLM_PROVIDER:-openai_compat}
+      - GATE_LLM_BASE_URL=${GATE_LLM_BASE_URL:-https://inference.asicloud.cudos.org/v1}
+      - GATE_LLM_MODEL=${GATE_LLM_MODEL:-openai/gpt-oss-120bt}
+      - GATE_LLM_API_KEY=${GATE_LLM_API_KEY:-}
+      - GATE_LLM_TIMEOUT_S=60
+      - GATE_CORS_ALLOW_ORIGINS=*
+    depends_on:
+      retrieval:
+        condition: service_started
+      document-storage:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - rag-network
+
+volumes:
+  opensearch-data:
+    driver: local
+  qdrant-data:
+    driver: local
+  postgres-data:
+    driver: local
+  document-storage-data:
+    driver: local
+  rustfs_data_0:
+    driver: local
+  rustfs_data_1:
+    driver: local
+  rustfs_data_2:
+    driver: local
+  rustfs_data_3:
+    driver: local
+  rustfs_logs:
+  rabbitmq-data:
+    driver: local
+
+networks:
+  rag-network:
+    driver: bridge

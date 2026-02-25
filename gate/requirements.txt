@@ -9,5 +9,5 @@ prometheus-client==0.21.1
 python-multipart==0.0.20
 aio-pika==9.4.3
 rapidfuzz==3.14.3
-
+tenacity==9.0.0
 
