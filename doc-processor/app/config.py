@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     retrieval_timeout_s: float = 60.0
 
     # VLM / Document parsing
-    vlm_provider: Literal["vllm", "landing_ai"] = "vllm"
+    vlm_provider: Literal["vllm", "landing_ai", "tika"] = "vllm"
 
     # vLLM (OpenAI-compatible)
     vlm_base_url: AnyHttpUrl = Field(default="http://vllm-docling:8123/v1")
@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     landing_model: str = "dpt-2-latest"
     landing_split: str = "page"
     landing_timeout_s: float = 120.0
+
+    # Apache Tika
+    tika_url: AnyHttpUrl = Field(default="http://tika:9998")
+    tika_timeout_s: float = 60.0
 
     # Limits
     max_pages: int = 25
@@ -65,6 +69,7 @@ class Settings(BaseSettings):
                 "api_key_set": self.landing_api_key is not None,
                 "timeout_s": self.landing_timeout_s,
             },
+            "tika": {"url": str(self.tika_url), "timeout_s": self.tika_timeout_s},
             "limits": {
                 "max_pages": self.max_pages,
                 "max_image_side_px": self.max_image_side_px,
@@ -83,4 +88,3 @@ def load_settings() -> Settings:
         if s.landing_api_key is None or s.landing_api_key.get_secret_value().strip() == "":
             raise ValueError("PROCESSOR_LANDING_API_KEY is required when PROCESSOR_VLM_PROVIDER=landing_ai")
     return s
-

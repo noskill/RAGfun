@@ -154,5 +154,23 @@ class LandingAIClient:
             return r.json()
 
 
+class TikaClient:
+    """
+    Apache Tika server client for binary -> text extraction.
+    """
+
+    def __init__(self, *, base_url: str, timeout_s: float) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._timeout_s = timeout_s
+
+    async def extract_text(self, *, content: bytes, content_type: str | None) -> str:
+        headers = {}
+        if content_type:
+            headers["Content-Type"] = content_type
+        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+            r = await client.put(f"{self._base_url}/tika", content=content, headers=headers)
+            r.raise_for_status()
+            return (r.text or "").strip()
+
 
 

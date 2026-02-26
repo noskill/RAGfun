@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 from app.chunking import chunk_by_strategy
-from app.clients import LandingAIClient, RetrievalClient, StorageClient, VLMClient
+from app.clients import LandingAIClient, RetrievalClient, StorageClient, TikaClient, VLMClient
 from app.config import Settings, load_settings
 from app.extraction import extract_text_non_vlm, normalize_to_pdf, pdf_to_page_pngs
 from app.logging_setup import setup_json_logging
@@ -55,7 +55,7 @@ PROCESSOR_EXTRACTED_CHARS = Histogram(
 )
 
 # Pre-create common label series so Grafana panels show 0 instead of "No data" right after startup.
-for _p in ("vlm", "landing_ai", "non_vlm", "skipped_duplicate"):
+for _p in ("vlm", "landing_ai", "tika", "non_vlm", "skipped_duplicate"):
     PROCESSOR_PATH.labels(_p).inc(0)
 PROCESSOR_PARTIAL.labels(endpoint="/v1/process").inc(0)
 
@@ -66,6 +66,7 @@ class AppState:
     retrieval: RetrievalClient | None = None
     vlm: VLMClient | None = None
     landing: LandingAIClient | None = None
+    tika: TikaClient | None = None
 
 
 state = AppState()
@@ -157,6 +158,11 @@ async def lifespan(app: FastAPI):
             split=state.settings.landing_split,
             timeout_s=state.settings.landing_timeout_s,
         )
+    elif state.settings.vlm_provider == "tika":
+        state.tika = TikaClient(
+            base_url=str(state.settings.tika_url),
+            timeout_s=state.settings.tika_timeout_s,
+        )
     else:
         state.vlm = VLMClient(
             base_url=str(state.settings.vlm_base_url),
@@ -218,7 +224,9 @@ async def readyz(response: Response):
     if state.config_error:
         response.status_code = 503
         return {"ready": False, "config_error": state.config_error}
-    ready = state.storage is not None and state.retrieval is not None and state.vlm is not None
+    ready = state.storage is not None and state.retrieval is not None and (
+        state.vlm is not None or state.landing is not None or state.tika is not None
+    )
     if not ready:
         response.status_code = 503
     return {"ready": ready}
@@ -245,7 +253,7 @@ async def process(req: ProcessRequest):
     assert state.settings is not None
     assert state.storage is not None
     assert state.retrieval is not None
-    assert state.vlm is not None
+    assert (state.vlm is not None) or (state.landing is not None) or (state.tika is not None)
 
     doc_id = req.document.doc_id
 
@@ -303,6 +311,17 @@ async def process(req: ProcessRequest):
         content_type = ed.content_type or content_type
         degraded.append("vlm_skipped")
         PROCESSOR_PATH.labels("non_vlm").inc()
+    elif state.settings.vlm_provider == "tika":
+        if state.tika is None:
+            REQS.labels(endpoint="/v1/process", status="500").inc()
+            return ProcessResponse(ok=False, doc_id=doc_id, error="tika_unavailable", detail="Tika client not configured")
+        with LAT.labels("tika").time():
+            text = await state.tika.extract_text(content=raw, content_type=content_type)
+        pages_text = [text] if text else []
+        pages = 1 if text else 0
+        if not text:
+            degraded.append("tika_empty")
+        PROCESSOR_PATH.labels("tika").inc()
     else:
         if state.settings.vlm_provider == "landing_ai":
             if state.landing is None:

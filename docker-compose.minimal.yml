@@ -226,6 +226,9 @@ services:
       - PROCESSOR_LANDING_MODEL=${PROCESSOR_LANDING_MODEL:-dpt-2-latest}
       - PROCESSOR_LANDING_SPLIT=${PROCESSOR_LANDING_SPLIT:-page}
       - PROCESSOR_LANDING_TIMEOUT_S=${PROCESSOR_LANDING_TIMEOUT_S:-180}
+      # Optional: Apache Tika server for text extraction
+      - PROCESSOR_TIKA_URL=${PROCESSOR_TIKA_URL:-http://tika:9998}
+      - PROCESSOR_TIKA_TIMEOUT_S=${PROCESSOR_TIKA_TIMEOUT_S:-60}
       - PROCESSOR_MAX_PAGES=35
       - PROCESSOR_MAX_IMAGE_SIDE_PX=2000
       - PROCESSOR_CHUNK_SIZE_CHARS=4000
@@ -268,6 +271,23 @@ services:
         condition: service_started
       doc-processor:
         condition: service_started
+    networks:
+      - rag-network
+
+  # Optional: Apache Tika for document text extraction
+  tika:
+    image: apache/tika:latest
+    container_name: tika
+    ports:
+      - "9998:9998"
+    environment:
+      - TIKA_SERVER_JAVA_OPTS=-Xms512m -Xmx1024m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9998/tika"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
       - rag-network
 
